@@ -3,13 +3,15 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use rgd::cgroup::{self, Snapshot};
+use rgd::policy;
 use rgd::psi::{self, Resource, Trigger};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rgd",
     version,
-    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon (Session 1.1 observer)"
+    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon (Milestone 1 observer)"
 )]
 struct Cli {
     /// Which kernel PSI resource to monitor.
@@ -25,6 +27,10 @@ struct Cli {
     #[arg(long, default_value_t = 1000)]
     window_ms: u64,
 
+    /// How many top offender cgroups to log per trigger fire.
+    #[arg(long, default_value_t = 5)]
+    top_n: usize,
+
     /// Increase log verbosity: `-v` = debug, `-vv` = trace.
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,
@@ -39,32 +45,67 @@ async fn main() -> Result<()> {
         resource = cli.resource.as_str(),
         threshold_ms = cli.threshold_ms,
         window_ms = cli.window_ms,
-        "starting PSI trigger loop (observer mode, no enforcement)"
+        top_n = cli.top_n,
+        "starting PSI + per-cgroup observer (no enforcement)"
     );
 
     let threshold_us = cli.threshold_ms.saturating_mul(1_000);
     let window_us = cli.window_ms.saturating_mul(1_000);
 
-    let trigger = Trigger::new(cli.resource, threshold_us, window_us)
-        .context("setting up PSI trigger")?;
+    let trigger =
+        Trigger::new(cli.resource, threshold_us, window_us).context("setting up PSI trigger")?;
+
+    // Establish an initial baseline so the first fire has something to diff against.
+    let mut previous: Snapshot = cgroup::snapshot(cli.resource)
+        .context("taking initial per-cgroup pressure snapshot")?;
+    info!(
+        cgroups = previous.len(),
+        "baseline pressure snapshot established"
+    );
 
     loop {
         trigger.wait().await.context("waiting on PSI trigger")?;
+
+        let current = match cgroup::snapshot(cli.resource) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to snapshot cgroup pressure; skipping this fire");
+                continue;
+            }
+        };
+
         match psi::read_current(cli.resource) {
             Ok(p) => info!(
                 resource = cli.resource.as_str(),
                 some_avg10 = p.some_avg10,
                 some_avg60 = p.some_avg60,
-                some_avg300 = p.some_avg300,
                 some_total_usec = p.some_total_usec,
                 full_avg10 = p.full_avg10,
-                full_avg60 = p.full_avg60,
-                full_avg300 = p.full_avg300,
-                full_total_usec = p.full_total_usec,
-                "PSI trigger fired"
+                "system-wide PSI at trigger fire"
             ),
-            Err(e) => warn!(error = %e, "trigger fired but failed to read PSI snapshot"),
+            Err(e) => warn!(error = %e, "failed to read system-wide PSI snapshot"),
         }
+
+        let top = policy::rank(&previous, &current, cli.top_n);
+        if top.is_empty() {
+            info!(
+                tracked = current.len(),
+                "trigger fired but no cgroup showed a positive some-delta"
+            );
+        } else {
+            for (i, attr) in top.iter().enumerate() {
+                info!(
+                    rank = i + 1,
+                    path = %attr.path.display(),
+                    some_delta_usec = attr.some_delta_usec,
+                    full_delta_usec = attr.full_delta_usec,
+                    some_total_usec = attr.some_total_usec,
+                    "offender"
+                );
+            }
+        }
+
+        previous = current;
     }
 }
 

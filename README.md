@@ -1,0 +1,3 @@
+# Responsiveness Guardian Daemon
+
+TBD

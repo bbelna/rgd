@@ -1,0 +1,35 @@
+[package]
+name = "rgd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Responsiveness Guardian — a PSI-driven Linux desktop responsiveness daemon."
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rgd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+nix = { version = "0.28", features = ["socket", "fs", "poll"] }
+xattr = "1"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

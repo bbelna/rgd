@@ -1,8 +1,11 @@
 pub mod pressure;
+pub mod procs;
 pub mod tree;
+pub mod unit;
 
 pub use pressure::{read_one, snapshot, snapshot_from_nodes, CgroupPressure, Snapshot};
 pub use tree::{pressure_file, walk, walk_from, CgroupNode, CGROUP_ROOT};
+pub use unit::{from_path as unit_from_path, UnitRef};
 
 #[cfg(test)]
 pub(crate) mod tests_util {

@@ -90,13 +90,14 @@ async fn main() -> Result<()> {
         if top.is_empty() {
             info!(
                 tracked = current.len(),
-                "trigger fired but no cgroup showed a positive some-delta"
+                "trigger fired but no cgroup had a positive exclusive delta"
             );
         } else {
             for (i, attr) in top.iter().enumerate() {
                 info!(
                     rank = i + 1,
                     path = %attr.path.display(),
+                    exclusive_delta_usec = attr.exclusive_delta_usec,
                     some_delta_usec = attr.some_delta_usec,
                     full_delta_usec = attr.full_delta_usec,
                     some_total_usec = attr.some_total_usec,

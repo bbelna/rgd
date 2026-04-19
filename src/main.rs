@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use rgd::cgroup::{self, Snapshot};
 use rgd::policy;
+use rgd::protect::ProtectSet;
 use rgd::psi::{self, Resource, Trigger};
 
 #[derive(Parser, Debug)]
@@ -77,6 +78,13 @@ async fn main() -> Result<()> {
         "baseline pressure snapshot established"
     );
 
+    let protect = ProtectSet::discover();
+    info!(
+        pids = protect.pids.len(),
+        cgroups = protect.cgroups.len(),
+        "protect set ready"
+    );
+
     loop {
         trigger.wait().await.context("waiting on PSI trigger")?;
 
@@ -130,24 +138,28 @@ async fn main() -> Result<()> {
                 let unit = cgroup::unit_from_path(&attr.path);
                 let procs = cgroup::procs::read_count(&attr.path).unwrap_or(0);
                 let delta_str = fmt_duration_us(attr.exclusive_delta_usec);
+                let protected = protect.covers(&attr.path);
+                let marker = if protected { " [PROTECTED]" } else { "" };
                 info!(
                     rank = i + 1,
                     path = %attr.path.display(),
                     unit = %unit.unit,
                     display = %unit.display,
                     procs,
+                    protected,
                     exclusive_delta_usec = attr.exclusive_delta_usec,
                     some_delta_usec = attr.some_delta_usec,
                     full_delta_usec = attr.full_delta_usec,
                     some_total_usec = attr.some_total_usec,
                     system_delta_usec = sys_delta_usec,
-                    "[{}/some +{}/{}] {} ({}, {} procs) — delta {} of {} total",
+                    "[{}/some +{}/{}] {} ({}, {} procs){} — delta {} of {} total",
                     resource_str,
                     sys_delta_str,
                     window_str,
                     unit.unit,
                     unit.display,
                     procs,
+                    marker,
                     delta_str,
                     sys_delta_str,
                 );

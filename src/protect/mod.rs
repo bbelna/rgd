@@ -1,13 +1,17 @@
+pub mod audio;
+pub mod dbus;
 pub mod wayland;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::RwLock;
+use zbus::Connection;
+
 /// Set of cgroups and PIDs we must never throttle — compositor, portals,
-/// audio stack in future sessions, etc. Discovery is pluggable; v1 of the
-/// discovery only talks to the Wayland sockets. D-Bus and session queries
-/// land in sessions 2.2 and 2.3.
+/// audio stack.
 #[derive(Debug, Clone)]
 pub struct ProtectSet {
     pub cgroups: HashSet<PathBuf>,
@@ -24,23 +28,47 @@ impl ProtectSet {
         }
     }
 
-    /// Query every source and build a fresh protect set. Logs each
-    /// compositor it resolves at `info` so operators can see what's
-    /// being held harmless.
-    pub fn discover() -> Self {
+    /// Run every discovery source and build a fresh set. Safe to call
+    /// repeatedly (eg. on `NameOwnerChanged`). Each run logs what it finds
+    /// at `info`.
+    pub async fn discover(bus: Option<&Connection>) -> Self {
         let mut set = Self::empty();
+
         for comp in wayland::discover_compositors() {
             tracing::info!(
                 source = "wayland",
                 socket = %comp.socket.display(),
                 pid = comp.pid,
-                cgroup = %comp.cgroup.display(),
                 scope = %comp.scope_cgroup.display(),
-                "protected: compositor"
+                "protected: compositor",
             );
             set.pids.insert(comp.pid);
             set.cgroups.insert(comp.scope_cgroup);
         }
+
+        if let Some(conn) = bus {
+            for svc in dbus::discover_named_services(conn).await {
+                tracing::info!(
+                    source = "dbus",
+                    bus_name = %svc.bus_name,
+                    pid = svc.pid,
+                    scope = %svc.scope_cgroup.display(),
+                    "protected: named service",
+                );
+                set.pids.insert(svc.pid);
+                set.cgroups.insert(svc.scope_cgroup);
+            }
+        }
+
+        for path in audio::discover_audio_stack() {
+            tracing::info!(
+                source = "audio",
+                scope = %path.display(),
+                "protected: audio",
+            );
+            set.cgroups.insert(path);
+        }
+
         set.refreshed_at = Instant::now();
         set
     }
@@ -54,13 +82,40 @@ impl ProtectSet {
         self.cgroups.contains(path)
     }
 
-    /// True if `path` equals or is a descendant of any protected cgroup —
-    /// the semantically interesting check for "should this cgroup be
-    /// off-limits to the attributor".
+    /// True if `path` equals or is a descendant of any protected cgroup.
+    /// The attribution-filter predicate.
     pub fn covers(&self, path: &Path) -> bool {
         self.cgroups
             .iter()
             .any(|protected| path == protected || path.starts_with(protected))
+    }
+}
+
+/// Shared handle to a `ProtectSet` that can be atomically swapped. The
+/// trigger loop reads it; a background task refreshes it on
+/// `NameOwnerChanged`.
+#[derive(Clone)]
+pub struct Protect {
+    inner: Arc<RwLock<ProtectSet>>,
+}
+
+impl Protect {
+    pub fn new(set: ProtectSet) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(set)),
+        }
+    }
+
+    /// Clone a snapshot of the current set. Cheap (HashSet clone, ~dozens of
+    /// entries). Preferred over holding a read guard across `.await` points
+    /// in the trigger loop.
+    pub async fn snapshot(&self) -> ProtectSet {
+        self.inner.read().await.clone()
+    }
+
+    pub async fn replace(&self, new_set: ProtectSet) {
+        let mut guard = self.inner.write().await;
+        *guard = new_set;
     }
 }
 
@@ -104,5 +159,14 @@ mod tests {
         let s = ProtectSet::empty();
         assert!(s.is_empty());
         assert!(!s.covers(Path::new("/anything")));
+    }
+
+    #[tokio::test]
+    async fn protect_handle_snapshot_and_replace() {
+        let handle = Protect::new(set_with(&["/a"]));
+        assert!(handle.snapshot().await.contains_cgroup(Path::new("/a")));
+        handle.replace(set_with(&["/b"])).await;
+        assert!(!handle.snapshot().await.contains_cgroup(Path::new("/a")));
+        assert!(handle.snapshot().await.contains_cgroup(Path::new("/b")));
     }
 }

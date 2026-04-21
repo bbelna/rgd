@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::cgroup::pressure::Snapshot;
+use crate::protect::ProtectSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
@@ -14,6 +15,17 @@ pub struct Attribution {
     pub some_delta_usec: u64,
     pub full_delta_usec: u64,
     pub some_total_usec: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ranking {
+    /// Unprotected cgroups eligible for enforcement, up to `top_n`, highest
+    /// exclusive-delta first.
+    pub offenders: Vec<Attribution>,
+    /// Cgroups that *would* have ranked in the top-N had they not been
+    /// covered by the protect set. Logged so operators can see which
+    /// protections are actually biting.
+    pub protected_skipped: Vec<Attribution>,
 }
 
 /// Rank cgroups by their *exclusive* share of a pressure delta.
@@ -32,13 +44,47 @@ pub struct Attribution {
 /// Tie-break on equal exclusive deltas is lexicographic by path, for stable
 /// output.
 pub fn rank(previous: &Snapshot, current: &Snapshot, top_n: usize) -> Vec<Attribution> {
+    let mut ranked = full_rank(previous, current);
+    ranked.truncate(top_n);
+    ranked
+}
+
+/// Like [`rank`], but partitions the result into actionable offenders and a
+/// separate list of protected cgroups that would otherwise have been ranked.
+/// Preserves all ordering; each list is independently capped at `top_n`.
+pub fn rank_with_protection(
+    previous: &Snapshot,
+    current: &Snapshot,
+    top_n: usize,
+    protect: &ProtectSet,
+) -> Ranking {
+    let all = full_rank(previous, current);
+    let mut offenders = Vec::with_capacity(top_n);
+    let mut protected_skipped = Vec::with_capacity(top_n);
+    for attr in all {
+        if protect.covers(&attr.path) {
+            if protected_skipped.len() < top_n {
+                protected_skipped.push(attr);
+            }
+        } else if offenders.len() < top_n {
+            offenders.push(attr);
+        }
+        if offenders.len() >= top_n && protected_skipped.len() >= top_n {
+            break;
+        }
+    }
+    Ranking {
+        offenders,
+        protected_skipped,
+    }
+}
+
+fn full_rank(previous: &Snapshot, current: &Snapshot) -> Vec<Attribution> {
     debug_assert_eq!(
         previous.resource, current.resource,
         "rank() called with mismatched snapshot resources",
     );
 
-    // Pass 1: cumulative deltas for cgroups seen in both snapshots, dropping
-    // anything with zero some-delta before we go any further.
     struct Raw {
         some: u64,
         full: u64,
@@ -64,9 +110,6 @@ pub fn rank(previous: &Snapshot, current: &Snapshot, top_n: usize) -> Vec<Attrib
         );
     }
 
-    // Pass 2: for each cgroup, sum its direct children's cumulative deltas —
-    // but only counting children that are themselves in `raw`. A cgroup
-    // missing from `raw` contributed zero, so leaving it out is correct.
     let mut children_sum: HashMap<PathBuf, u64> = HashMap::with_capacity(raw.len());
     for (path, r) in &raw {
         let Some(parent) = path.parent() else { continue };
@@ -76,8 +119,6 @@ pub fn rank(previous: &Snapshot, current: &Snapshot, top_n: usize) -> Vec<Attrib
         *children_sum.entry(parent.to_path_buf()).or_insert(0) += r.some;
     }
 
-    // Pass 3: build attributions, keeping only cgroups with a positive
-    // exclusive delta.
     let mut results: Vec<Attribution> = raw
         .into_iter()
         .filter_map(|(path, r)| {
@@ -101,7 +142,6 @@ pub fn rank(previous: &Snapshot, current: &Snapshot, top_n: usize) -> Vec<Attrib
             .cmp(&a.exclusive_delta_usec)
             .then_with(|| a.path.cmp(&b.path))
     });
-    results.truncate(top_n);
     results
 }
 
@@ -289,5 +329,63 @@ mod tests {
             Path::new("/a/b/c")
         ));
         assert!(!is_direct_child(Path::new("/a"), Path::new("/b")));
+    }
+
+    fn protect_with(paths: &[&str]) -> ProtectSet {
+        let mut s = ProtectSet::empty();
+        for p in paths {
+            s.cgroups.insert(PathBuf::from(p));
+        }
+        s
+    }
+
+    #[test]
+    fn rank_with_protection_splits_covered_cgroups() {
+        let prev = snap(&[("/a", 0, 0), ("/b", 0, 0), ("/c", 0, 0)]);
+        let cur = snap(&[("/a", 1000, 0), ("/b", 500, 0), ("/c", 250, 0)]);
+        let protect = protect_with(&["/a"]);
+        let ranking = rank_with_protection(&prev, &cur, 5, &protect);
+
+        assert_eq!(ranking.protected_skipped.len(), 1);
+        assert_eq!(ranking.protected_skipped[0].path, PathBuf::from("/a"));
+
+        assert_eq!(ranking.offenders.len(), 2);
+        assert_eq!(ranking.offenders[0].path, PathBuf::from("/b"));
+        assert_eq!(ranking.offenders[1].path, PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn rank_with_protection_caps_each_list_independently() {
+        let prev = snap(&[("/a", 0, 0), ("/b", 0, 0), ("/c", 0, 0), ("/d", 0, 0)]);
+        let cur = snap(&[("/a", 400, 0), ("/b", 300, 0), ("/c", 200, 0), ("/d", 100, 0)]);
+        let protect = protect_with(&["/a", "/c"]);
+        let ranking = rank_with_protection(&prev, &cur, 1, &protect);
+        assert_eq!(ranking.offenders.len(), 1);
+        assert_eq!(ranking.offenders[0].path, PathBuf::from("/b"));
+        assert_eq!(ranking.protected_skipped.len(), 1);
+        assert_eq!(ranking.protected_skipped[0].path, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn rank_with_protection_covers_descendants() {
+        // `/parent` is protected; the pressure source is `/parent/child` — it
+        // still counts as protected.
+        let prev = snap(&[("/parent", 0, 0), ("/parent/child", 0, 0), ("/other", 0, 0)]);
+        let cur = snap(&[
+            ("/parent", 500, 0),
+            ("/parent/child", 500, 0),
+            ("/other", 100, 0),
+        ]);
+        let protect = protect_with(&["/parent"]);
+        let ranking = rank_with_protection(&prev, &cur, 5, &protect);
+        assert_eq!(ranking.offenders.len(), 1);
+        assert_eq!(ranking.offenders[0].path, PathBuf::from("/other"));
+        // `/parent` has zero exclusive (child consumes it all) so doesn't
+        // appear; `/parent/child` is covered by `/parent`.
+        assert_eq!(ranking.protected_skipped.len(), 1);
+        assert_eq!(
+            ranking.protected_skipped[0].path,
+            PathBuf::from("/parent/child")
+        );
     }
 }

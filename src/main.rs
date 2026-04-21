@@ -1,18 +1,23 @@
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::StreamExt;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use zbus::fdo::DBusProxy;
+use zbus::Connection;
 
 use rgd::cgroup::{self, Snapshot};
-use rgd::policy;
-use rgd::protect::ProtectSet;
+use rgd::policy::{self, LadderConfig, StateMachine, Transition};
+use rgd::protect::{self, Protect, ProtectSet};
 use rgd::psi::{self, Resource, Trigger};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rgd",
     version,
-    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon (Milestone 1 observer)"
+    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon (Milestone 1–3 observer)"
 )]
 struct Cli {
     /// Which kernel PSI resource to monitor.
@@ -59,7 +64,7 @@ async fn main() -> Result<()> {
         window_ms = cli.window_ms,
         top_n = cli.top_n,
         log_format = ?cli.log_format,
-        "starting PSI + per-cgroup observer (no enforcement)"
+        "starting PSI + per-cgroup observer (dry-run policy engine)"
     );
 
     let threshold_us = cli.threshold_ms.saturating_mul(1_000);
@@ -78,12 +83,34 @@ async fn main() -> Result<()> {
         "baseline pressure snapshot established"
     );
 
-    let protect = ProtectSet::discover();
+    // Connect to the session bus once; the handle drives both the initial
+    // D-Bus discovery and the NameOwnerChanged listener.
+    let bus = match Connection::session().await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(error = %e, "no session D-Bus; D-Bus discovery disabled");
+            None
+        }
+    };
+
+    let initial = ProtectSet::discover(bus.as_ref()).await;
     info!(
-        pids = protect.pids.len(),
-        cgroups = protect.cgroups.len(),
+        pids = initial.pids.len(),
+        cgroups = initial.cgroups.len(),
         "protect set ready"
     );
+    let protect = Protect::new(initial);
+
+    if let Some(conn) = bus.clone() {
+        let handle = protect.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_name_owner_listener(conn, handle).await {
+                warn!(error = %e, "NameOwnerChanged listener exited");
+            }
+        });
+    }
+
+    let mut state_machine = StateMachine::new(LadderConfig::default());
 
     loop {
         trigger.wait().await.context("waiting on PSI trigger")?;
@@ -110,7 +137,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Full system PSI stays at debug so the info log is clean.
         if let Some(p) = sys_snapshot {
             debug!(
                 resource = cli.resource.as_str(),
@@ -123,50 +149,165 @@ async fn main() -> Result<()> {
             );
         }
 
-        let top = policy::rank(&previous, &current, cli.top_n);
-        if top.is_empty() {
+        let set_snapshot = protect.snapshot().await;
+        let ranking = policy::rank_with_protection(&previous, &current, cli.top_n, &set_snapshot);
+
+        if ranking.offenders.is_empty() && ranking.protected_skipped.is_empty() {
             info!(
                 tracked = current.len(),
                 system_delta_usec = sys_delta_usec,
                 "trigger fired but no cgroup had a positive exclusive delta"
             );
-        } else {
-            let window_str = fmt_window(cli.window_ms);
-            let sys_delta_str = fmt_duration_us(sys_delta_usec);
-            let resource_str = cli.resource.as_str();
-            for (i, attr) in top.iter().enumerate() {
-                let unit = cgroup::unit_from_path(&attr.path);
-                let procs = cgroup::procs::read_count(&attr.path).unwrap_or(0);
-                let delta_str = fmt_duration_us(attr.exclusive_delta_usec);
-                let protected = protect.covers(&attr.path);
-                let marker = if protected { " [PROTECTED]" } else { "" };
-                info!(
-                    rank = i + 1,
-                    path = %attr.path.display(),
-                    unit = %unit.unit,
-                    display = %unit.display,
-                    procs,
-                    protected,
-                    exclusive_delta_usec = attr.exclusive_delta_usec,
-                    some_delta_usec = attr.some_delta_usec,
-                    full_delta_usec = attr.full_delta_usec,
-                    some_total_usec = attr.some_total_usec,
-                    system_delta_usec = sys_delta_usec,
-                    "[{}/some +{}/{}] {} ({}, {} procs){} — delta {} of {} total",
-                    resource_str,
-                    sys_delta_str,
-                    window_str,
-                    unit.unit,
-                    unit.display,
-                    procs,
-                    marker,
-                    delta_str,
-                    sys_delta_str,
-                );
-            }
+        }
+
+        let window_str = fmt_window(cli.window_ms);
+        let sys_delta_str = fmt_duration_us(sys_delta_usec);
+        let resource_str = cli.resource.as_str();
+
+        for attr in &ranking.protected_skipped {
+            let unit = cgroup::unit_from_path(&attr.path);
+            let procs = cgroup::procs::read_count(&attr.path).unwrap_or(0);
+            let delta_str = fmt_duration_us(attr.exclusive_delta_usec);
+            info!(
+                path = %attr.path.display(),
+                unit = %unit.unit,
+                display = %unit.display,
+                procs,
+                exclusive_delta_usec = attr.exclusive_delta_usec,
+                "[PROTECTED] {} ({}, {} procs) — {} (skipped; would have ranked)",
+                unit.unit,
+                unit.display,
+                procs,
+                delta_str,
+            );
+        }
+
+        for (i, attr) in ranking.offenders.iter().enumerate() {
+            let unit = cgroup::unit_from_path(&attr.path);
+            let procs = cgroup::procs::read_count(&attr.path).unwrap_or(0);
+            let delta_str = fmt_duration_us(attr.exclusive_delta_usec);
+            info!(
+                rank = i + 1,
+                path = %attr.path.display(),
+                unit = %unit.unit,
+                display = %unit.display,
+                procs,
+                exclusive_delta_usec = attr.exclusive_delta_usec,
+                some_delta_usec = attr.some_delta_usec,
+                full_delta_usec = attr.full_delta_usec,
+                some_total_usec = attr.some_total_usec,
+                system_delta_usec = sys_delta_usec,
+                "[{}/some +{}/{}] {} ({}, {} procs) — delta {} of {} total",
+                resource_str,
+                sys_delta_str,
+                window_str,
+                unit.unit,
+                unit.display,
+                procs,
+                delta_str,
+                sys_delta_str,
+            );
+        }
+
+        let observations: Vec<(std::path::PathBuf, u64)> = ranking
+            .offenders
+            .iter()
+            .map(|a| (a.path.clone(), a.exclusive_delta_usec))
+            .collect();
+        let transitions = state_machine.observe(Instant::now(), &observations);
+        for t in transitions {
+            log_transition(&t);
         }
 
         previous = current;
+    }
+}
+
+async fn run_name_owner_listener(conn: Connection, protect: Protect) -> Result<()> {
+    let proxy = DBusProxy::new(&conn)
+        .await
+        .context("building DBusProxy for NameOwnerChanged subscription")?;
+    let mut stream = proxy
+        .receive_name_owner_changed()
+        .await
+        .context("subscribing to NameOwnerChanged")?;
+    debug!("NameOwnerChanged listener started");
+
+    while let Some(signal) = stream.next().await {
+        let Ok(args) = signal.args() else {
+            continue;
+        };
+        let name = args.name.as_str();
+        if protect::dbus::is_tracked_name(name) {
+            info!(
+                bus_name = %name,
+                old_owner = ?args.old_owner,
+                new_owner = ?args.new_owner,
+                "tracked name ownership changed; refreshing protect set",
+            );
+            let refreshed = ProtectSet::discover(Some(&conn)).await;
+            protect.replace(refreshed).await;
+        }
+    }
+    Ok(())
+}
+
+fn log_transition(t: &Transition) {
+    match t {
+        Transition::Enter { path } => {
+            info!(path = %path.display(), "[DRY-RUN] enter: tracking at Observe");
+        }
+        Transition::Escalate {
+            path,
+            from,
+            to,
+            delta_usec,
+            dwell,
+        } => {
+            info!(
+                path = %path.display(),
+                from = from.as_str(),
+                to = to.as_str(),
+                delta_usec = *delta_usec,
+                dwell_ms = dwell.as_millis() as u64,
+                "[DRY-RUN] would: {}: {} → {} (Δ={}, dwell={:.1}s)",
+                path.display(),
+                from.as_str(),
+                to.as_str(),
+                fmt_duration_us(*delta_usec),
+                dwell.as_secs_f64(),
+            );
+        }
+        Transition::Deescalate {
+            path,
+            from,
+            to,
+            clear_for,
+        } => {
+            info!(
+                path = %path.display(),
+                from = from.as_str(),
+                to = to.as_str(),
+                clear_for_ms = clear_for.as_millis() as u64,
+                "[DRY-RUN] would: {}: {} → {} (clear={:.1}s)",
+                path.display(),
+                from.as_str(),
+                to.as_str(),
+                clear_for.as_secs_f64(),
+            );
+        }
+        Transition::Untrack {
+            path,
+            dwell_at_observe,
+        } => {
+            info!(
+                path = %path.display(),
+                dwell_at_observe_ms = dwell_at_observe.as_millis() as u64,
+                "[DRY-RUN] untrack: {} (Observe for {:.1}s)",
+                path.display(),
+                dwell_at_observe.as_secs_f64(),
+            );
+        }
     }
 }
 
@@ -205,10 +346,8 @@ fn fmt_window(ms: u64) -> String {
 
 fn fmt_duration_us(us: u64) -> String {
     if us >= 1_000_000 {
-        // ≥ 1s — show fractional seconds to 2dp.
         format!("{:.2}s", us as f64 / 1_000_000.0)
     } else {
-        // Round to nearest ms.
         format!("{}ms", (us + 500) / 1000)
     }
 }

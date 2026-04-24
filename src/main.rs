@@ -11,8 +11,9 @@ use zbus::fdo::DBusProxy;
 use zbus::Connection;
 
 use rgd::cgroup::{self, Snapshot};
+use rgd::config::Config;
 use rgd::enforce::{EnforceError, Enforcer, EnforcementGates, SystemdBackend};
-use rgd::policy::{self, LadderConfig, Level, StateMachine, Transition};
+use rgd::policy::{self, Level, StateMachine, Transition};
 use rgd::protect::{self, Protect, ProtectSet};
 use rgd::psi::{self, Resource, Trigger};
 
@@ -23,22 +24,29 @@ use rgd::psi::{self, Resource, Trigger};
     about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon"
 )]
 struct Cli {
-    /// Which kernel PSI resource to monitor.
-    #[arg(long, value_enum, default_value_t = Resource::Cpu)]
-    resource: Resource,
+    /// Path to a TOML config file. Defaults to
+    /// `$XDG_CONFIG_HOME/rgd/config.toml` (or `~/.config/rgd/config.toml`).
+    /// A present-but-malformed file is a hard error; a missing default-path
+    /// file falls through to built-in defaults.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Which kernel PSI resource to monitor. Overrides the config value.
+    #[arg(long, value_enum)]
+    resource: Option<Resource>,
 
     /// Stall amount (ms) that must accumulate within `--window-ms` to fire.
-    #[arg(long, default_value_t = 100)]
-    threshold_ms: u64,
+    #[arg(long)]
+    threshold_ms: Option<u64>,
 
     /// Rolling window (ms) over which stall is measured. Kernel accepts
     /// 500–10000 ms; values outside that range are rejected at trigger setup.
-    #[arg(long, default_value_t = 1000)]
-    window_ms: u64,
+    #[arg(long)]
+    window_ms: Option<u64>,
 
     /// How many top offender cgroups to log per trigger fire.
-    #[arg(long, default_value_t = 5)]
-    top_n: usize,
+    #[arg(long)]
+    top_n: Option<usize>,
 
     /// Apply graduated throttling. Without this flag every transition is
     /// logged as `[DRY-RUN] would: …` but no system state changes.
@@ -46,12 +54,14 @@ struct Cli {
     enforce: bool,
 
     /// Opt in to `cgroup.freeze` as an escalation step. Reversible, but
-    /// visibly pauses the cgroup's tasks — off by default.
+    /// visibly pauses the cgroup's tasks — off by default. OR'd with
+    /// `enforcement.enable_freeze` from the config.
     #[arg(long)]
     enable_freeze: bool,
 
     /// Opt in to `cgroup.kill`. Additionally requires per-cgroup
-    /// `user.rgd.allow_kill` xattr. Off by default.
+    /// `user.rgd.allow_kill` xattr. OR'd with `enforcement.enable_kill`
+    /// from the config. Off by default.
     #[arg(long)]
     enable_kill: bool,
 
@@ -65,6 +75,32 @@ struct Cli {
     verbose: u8,
 }
 
+/// CLI overrides applied on top of the file-loaded config. Boolean flags
+/// OR in (can't be turned off from the CLI if the config enables them).
+fn merge_cli_over_config(mut cfg: Config, cli: &Cli) -> Config {
+    if let Some(r) = cli.resource {
+        cfg.triggers.resource = r;
+    }
+    if let Some(t) = cli.threshold_ms {
+        cfg.triggers.threshold_ms = t;
+    }
+    if let Some(w) = cli.window_ms {
+        cfg.triggers.window_ms = w;
+    }
+    if let Some(n) = cli.top_n {
+        cfg.triggers.top_n = n;
+    }
+    if cli.enable_freeze {
+        cfg.enforcement.enable_freeze = true;
+        cfg.ladder.enable_freeze = true;
+    }
+    if cli.enable_kill {
+        cfg.enforcement.enable_kill = true;
+        cfg.ladder.enable_kill = true;
+    }
+    cfg
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum LogFormat {
     Text,
@@ -76,30 +112,34 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.log_format);
 
+    let file_cfg = Config::load(cli.config.as_deref()).context("loading config")?;
+    let cfg = merge_cli_over_config(file_cfg, &cli);
+
     let mode = if cli.enforce { "enforce" } else { "dry-run" };
+    let resource = cfg.triggers.resource;
     info!(
-        resource = cli.resource.as_str(),
-        threshold_ms = cli.threshold_ms,
-        window_ms = cli.window_ms,
-        top_n = cli.top_n,
+        resource = resource.as_str(),
+        threshold_ms = cfg.triggers.threshold_ms,
+        window_ms = cfg.triggers.window_ms,
+        top_n = cfg.triggers.top_n,
         mode,
-        enable_freeze = cli.enable_freeze,
-        enable_kill = cli.enable_kill,
+        enable_freeze = cfg.enforcement.enable_freeze,
+        enable_kill = cfg.enforcement.enable_kill,
+        config_source = cli.config.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "defaults".to_string()),
         log_format = ?cli.log_format,
         "starting responsiveness guardian"
     );
 
-    let threshold_us = cli.threshold_ms.saturating_mul(1_000);
-    let window_us = cli.window_ms.saturating_mul(1_000);
+    let threshold_us = cfg.triggers.threshold_ms.saturating_mul(1_000);
+    let window_us = cfg.triggers.window_ms.saturating_mul(1_000);
 
-    let trigger =
-        Trigger::new(cli.resource, threshold_us, window_us).context("setting up PSI trigger")?;
+    let trigger = Trigger::new(resource, threshold_us, window_us)
+        .context("setting up PSI trigger")?;
 
-    let mut previous: Snapshot = cgroup::snapshot(cli.resource)
-        .context("taking initial per-cgroup pressure snapshot")?;
-    let mut prev_system_some: Option<u64> = psi::read_current(cli.resource)
-        .map(|p| p.some_total_usec)
-        .ok();
+    let mut previous: Snapshot =
+        cgroup::snapshot(resource).context("taking initial per-cgroup pressure snapshot")?;
+    let mut prev_system_some: Option<u64> =
+        psi::read_current(resource).map(|p| p.some_total_usec).ok();
     info!(
         cgroups = previous.len(),
         "baseline pressure snapshot established"
@@ -138,8 +178,8 @@ async fn main() -> Result<()> {
             Some(conn) => {
                 let backend = SystemdBackend::from_session(conn.clone());
                 let gates = EnforcementGates {
-                    enable_freeze: cli.enable_freeze,
-                    enable_kill: cli.enable_kill,
+                    enable_freeze: cfg.enforcement.enable_freeze,
+                    enable_kill: cfg.enforcement.enable_kill,
                 };
                 info!(
                     enable_freeze = gates.enable_freeze,
@@ -160,11 +200,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut state_machine = StateMachine::new(LadderConfig {
-        enable_freeze: cli.enable_freeze,
-        enable_kill: cli.enable_kill,
-        ..LadderConfig::default()
-    });
+    let mut state_machine = StateMachine::new(cfg.ladder.clone());
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
@@ -184,7 +220,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        let current = match cgroup::snapshot(cli.resource) {
+        let current = match cgroup::snapshot(resource) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "failed to snapshot cgroup pressure; skipping this fire");
@@ -192,7 +228,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        let (sys_delta_usec, sys_snapshot) = match psi::read_current(cli.resource) {
+        let (sys_delta_usec, sys_snapshot) = match psi::read_current(resource) {
             Ok(p) => {
                 let delta = prev_system_some
                     .map(|prev| p.some_total_usec.saturating_sub(prev))
@@ -208,7 +244,7 @@ async fn main() -> Result<()> {
 
         if let Some(p) = sys_snapshot {
             debug!(
-                resource = cli.resource.as_str(),
+                resource = resource.as_str(),
                 some_avg10 = p.some_avg10,
                 some_avg60 = p.some_avg60,
                 some_avg300 = p.some_avg300,
@@ -219,7 +255,12 @@ async fn main() -> Result<()> {
         }
 
         let set_snapshot = protect.snapshot().await;
-        let ranking = policy::rank_with_protection(&previous, &current, cli.top_n, &set_snapshot);
+        let ranking = policy::rank_with_protection(
+            &previous,
+            &current,
+            cfg.triggers.top_n,
+            &set_snapshot,
+        );
 
         if ranking.offenders.is_empty() && ranking.protected_skipped.is_empty() {
             info!(
@@ -229,9 +270,9 @@ async fn main() -> Result<()> {
             );
         }
 
-        let window_str = fmt_window(cli.window_ms);
+        let window_str = fmt_window(cfg.triggers.window_ms);
         let sys_delta_str = fmt_duration_us(sys_delta_usec);
-        let resource_str = cli.resource.as_str();
+        let resource_str = resource.as_str();
 
         for attr in &ranking.protected_skipped {
             let unit = cgroup::unit_from_path(&attr.path);

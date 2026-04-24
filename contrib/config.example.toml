@@ -1,0 +1,94 @@
+# rgd — Responsiveness Guardian configuration
+#
+# Install to `$XDG_CONFIG_HOME/rgd/config.toml` (or `~/.config/rgd/config.toml`).
+# Override the path with `rgd --config <path>`.
+#
+# All keys are optional. A missing key falls through to the built-in default.
+# An unknown key is a hard startup error — typos shouldn't silently no-op.
+# CLI flags (`--threshold-ms`, `--enforce`, etc.) win over whatever's here.
+
+# -----------------------------------------------------------------------------
+# Trigger: when does the kernel wake the daemon?
+# -----------------------------------------------------------------------------
+[triggers]
+# Which PSI resource to monitor. Only "cpu" is wired up in v1; "memory" and
+# "io" ladders land in Milestone 5.
+resource = "cpu"
+
+# Stall budget. When the kernel sees this many milliseconds of "some" pressure
+# accumulated within `window_ms`, it fires the trigger and rgd wakes up.
+# Tighter thresholds catch more events but raise the floor on wakeups.
+threshold_ms = 100
+
+# Kernel accepts windows in the closed range [500, 10000]. Anything else
+# is rejected at trigger setup (EINVAL).
+window_ms = 1000
+
+# How many top offenders to log per trigger fire. Kept low — the attribution
+# pass ranks the whole tree, but only the top N make it into the log.
+top_n = 5
+
+# -----------------------------------------------------------------------------
+# Policy: how fast to escalate, how patient to be about de-escalating
+# -----------------------------------------------------------------------------
+#
+# Durations accept "100ms", "10s", "2m", "1h", or a bare integer (seconds).
+#
+# The escalation ladder:
+#
+#   Observe → Weight → Idle → Quota50 → Quota25 → Freeze → Kill
+#      ↑       ↑        ↑        ↑         ↑         ↑        ↑
+#      *       op1      op2      op3       op4       gated    gated
+#
+# `op1..op4` are the minimum dwell-at-current-level before stepping up.
+# `Freeze` and `Kill` are opt-in via `[enforcement]` and (for Kill) an xattr.
+[policy]
+# Minimum dwell at Observe before we'd step to Weight (CPUWeight=20).
+escalate_observe_to_weight = "10s"
+
+# Minimum dwell at Weight before we'd step to Idle (CPUWeight=1 + cpu.idle=1).
+escalate_weight_to_idle = "30s"
+
+# Minimum dwell at Idle before we'd step to Quota50 (CPUQuota=50%).
+escalate_idle_to_quota50 = "60s"
+
+# Minimum dwell at Quota50 before we'd step to Quota25 (CPUQuota=25%).
+escalate_quota50_to_quota25 = "120s"
+
+# Time a tracked cgroup must be clear of pressure before we step it down
+# one level. Too short and we thrash; too long and interventions overstay
+# their welcome.
+deescalate_after = "30s"
+
+# Time at Observe with no pressure before we forget the cgroup entirely.
+# Longer values retain history across transient quiet periods; shorter
+# values let state-machine memory rotate faster.
+untrack_after = "120s"
+
+# -----------------------------------------------------------------------------
+# Enforcement: the escape hatches
+# -----------------------------------------------------------------------------
+[enforcement]
+# Allow `cgroup.freeze=1` as an escalation step. Reversible (writing `0`
+# thaws), but visibly pauses every task in the cgroup.
+enable_freeze = false
+
+# Allow `cgroup.kill` as an escalation step. Also requires
+# `user.rgd.allow_kill` xattr on the specific cgroup — daemon-wide and
+# per-cgroup opt-ins. Off by default. Requires `enable_freeze = true`.
+enable_kill = false
+
+# -----------------------------------------------------------------------------
+# Protect: additional names to add to the protect set
+# -----------------------------------------------------------------------------
+[protect]
+# Extra D-Bus well-known names whose owner PID we resolve and add to the
+# protect set on top of the built-ins (org.gnome.Shell, org.kde.KWin,
+# org.freedesktop.portal.Desktop, portal backends, and the pipewire/
+# wireplumber audio stack).
+#
+# Example: protect your password manager so it never gets throttled while
+# you're racing to copy a secret.
+#
+# extra_names = ["org.keepassxc.KeePassXC.MainWindow"]
+extra_names = []

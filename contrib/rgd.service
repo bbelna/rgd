@@ -1,0 +1,68 @@
+# rgd — Responsiveness Guardian
+#
+# Install as a user unit:
+#   install -Dm644 contrib/rgd.service ~/.config/systemd/user/rgd.service
+#   install -Dm644 contrib/config.example.toml ~/.config/rgd/config.toml
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rgd.service
+#
+# Start in dry-run mode first. Let it run for a day against your normal
+# workload; read the log (`journalctl --user -u rgd -f`). Once attribution
+# looks right, add `--enforce` to the ExecStart line and restart.
+#
+# Deployment model rationale: v1 targets user-session CPU enforcement.
+# The daemon needs the session bus (to talk to the *user* systemd and
+# to resolve compositor/portal D-Bus names), so it must run as the user.
+# A privileged system unit becomes relevant if/when v1.5 grows system-
+# instance routing.
+
+[Unit]
+Description=Responsiveness Guardian — PSI-driven desktop responsiveness
+Documentation=https://github.com/bbelna/rgd
+After=graphical-session.target
+PartOf=graphical-session.target
+# rgd needs the session bus to do anything useful. Not listing dbus as a
+# dependency keeps the unit loadable on non-D-Bus sessions (they'll get
+# a warning and degraded discovery).
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/rgd
+Restart=on-failure
+RestartSec=5s
+# Dry-run is the default; intentionally no --enforce here. Edit with
+# `systemctl --user edit rgd.service` and add:
+#   [Service]
+#   ExecStart=
+#   ExecStart=%h/.cargo/bin/rgd --enforce
+
+# Resource isolation — rgd itself must never be the thing causing pressure.
+MemoryHigh=64M
+MemoryMax=128M
+CPUWeight=50
+
+# Hardening. We only read /sys/fs/cgroup, /proc, $XDG_RUNTIME_DIR (for
+# Wayland sockets), and the session bus; and we write cgroupfs knobs and
+# xattrs. Keep the exposed surface small.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=false
+ProtectHostname=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target

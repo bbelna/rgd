@@ -14,9 +14,6 @@ pub(crate) mod tests_util {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Minimal self-cleaning temp dir for unit tests — avoids pulling
-    /// `tempfile` as a dev-dep. Uniqueness: pid + unix-nanos + per-test
-    /// counter; sufficient within a single `cargo test` invocation.
     pub struct TempDir {
         path: PathBuf,
     }

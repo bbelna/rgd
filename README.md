@@ -47,26 +47,71 @@ has shipped every mechanism needed to do better, yet no daemon ties them togethe
    D-Bus well-known names (`org.gnome.Shell`, `org.kde.KWin`), and the portal
    / audio stack, and kept out of the throttle candidate set.
 
-## Safety model
-
-- **Dry-run is the default.** `--enforce` is an explicit, separate flag.
-- **Every intervention is reversible** through Level 4; Level 5 (freeze) is
-  reversible by unfreezing; Level 6 (kill) is off by default and
-  double-opt-in per `cgroup`.
-- **Source of truth is on the `cgroup` itself.** We write `user.rgd.level` and
-  `user.rgd.applied_at` xattrs *before* applying any property change. If the
-  daemon crashes, the breadcrumb trail stays with the `cgroup` and dies with it.
-- **Panic button.** `rgctl panic` walks the `cgroup` tree, strips every
-  `user.rgd.*` `xattr`, and unsets every property we could have set — designed
-  to work even if the daemon is wedged.
-- **Never touches** `system.slice`, `init.scope`, or anything containing PID
-  1, in v1.
-
 ## Building
 
 ```sh
 cargo build --release
 ```
+
+The binary lands at `target/release/rgd`. Copy it somewhere on `PATH`
+(or let cargo do it with `cargo install --path .`).
+
+## Installing
+
+`rgd` runs as a **user service** — it needs the session bus to talk to the
+user's `systemd` instance and to resolve the compositor. Install as:
+
+```sh
+install -Dm755 target/release/rgd ~/.cargo/bin/rgd
+install -Dm644 contrib/rgd.service ~/.config/systemd/user/rgd.service
+install -Dm644 contrib/config.example.toml ~/.config/rgd/config.toml
+install -Dm755 contrib/rgctl/rgctl ~/.local/bin/rgctl
+systemctl --user daemon-reload
+systemctl --user enable --now rgd.service
+```
+
+Tail the log:
+
+```sh
+journalctl --user -u rgd -f
+```
+
+## Quickstart (dry-run)
+
+The default mode is **observe only** — every intervention is logged as
+`[DRY-RUN] would: …` with nothing actually changed. Let it run for a day of
+your normal workload and read the log; the attribution should track your
+intuition about what's causing stalls.
+
+```sh
+rgd                              # defaults from ~/.config/rgd/config.toml
+rgd --log-format json | jq .     # JSON events, handy with `jq`
+```
+
+When the attribution looks right, flip to enforcement:
+
+```sh
+rgd --enforce                    # CPUWeight / CPUQuota via systemd
+rgd --enforce --enable-freeze    # adds cgroup.freeze as an escalation step
+```
+
+## Safety model
+
+- **Dry-run is the default.** `--enforce` is an explicit, separate flag.
+- **Every intervention is reversible** through Level 4; Level 5 (freeze) is
+  reversible by unfreezing; Level 6 (kill) is off by default and
+  double-opt-in (daemon flag **and** per-cgroup `user.rgd.allow_kill` xattr).
+- **Source of truth is on the `cgroup` itself.** `user.rgd.level` and
+  `user.rgd.applied_at` xattrs are written *before* applying any property
+  change. If the daemon crashes, the breadcrumb stays with the `cgroup` and
+  dies when the `cgroup` does.
+- **Panic button.** `rgctl panic` walks the `cgroup` tree, strips every
+  `user.rgd.*` `xattr`, and unsets every property `rgd` could have applied
+  — designed to work even if the daemon is wedged.
+- `rgctl status` prints a table of currently-tracked cgroups with their
+  level, timestamp, preference, and kill-gate state.
+- **Never touches** `system.slice`, `init.scope`, or anything containing
+  PID 1, in v1.
 
 ## References
 

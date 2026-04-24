@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# rgctl — companion tool for rgd.
+#
+#   rgctl status   List every cgroup carrying rgd state (user.rgd.*).
+#   rgctl panic    Clear all rgd state and unset every property rgd could
+#                  have applied. Designed to work even if rgd is wedged.
+#
+# Reads/writes xattrs on cgroup directories and calls systemd via the
+# current user's systemd instance. Exits non-zero only if panic fails to
+# fully restore at least one cgroup; missing tools (systemctl, setfattr)
+# cause an early, explicit failure.
+
+set -u
+
+CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
+
+RGD_KEYS=(
+    user.rgd.level
+    user.rgd.applied_at
+    user.rgd.preference
+    user.rgd.allow_kill
+)
+
+die() {
+    printf 'rgctl: %s\n' "$*" >&2
+    exit 2
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: rgctl <command>
+
+Commands:
+  status    List cgroups carrying rgd state.
+  panic     Strip all rgd state and revert every property rgd applied.
+
+Environment:
+  CGROUP_ROOT   Override cgroup mountpoint (default: /sys/fs/cgroup).
+EOF
+}
+
+# Walk the cgroup tree and for every directory, print the xattr pair
+# `<level>|<applied_at>|<preference>|<allow_kill>|<path>` on cgroups where
+# user.rgd.level is set. Missing individual keys are printed as empty.
+list_tracked() {
+    need getfattr
+    # -P: don't follow symlinks. -h: same. -R: recurse. We use `find` instead
+    # of -R to keep output deterministic and avoid pulling in every xattr on
+    # every cgroup (there are thousands).
+    find "$CGROUP_ROOT" -type d 2>/dev/null | while read -r dir; do
+        local level
+        level=$(getfattr --only-values -n user.rgd.level -- "$dir" 2>/dev/null) || continue
+        [ -z "$level" ] && continue
+        local applied
+        applied=$(getfattr --only-values -n user.rgd.applied_at -- "$dir" 2>/dev/null || true)
+        local pref
+        pref=$(getfattr --only-values -n user.rgd.preference -- "$dir" 2>/dev/null || true)
+        local allow
+        allow=$(getfattr --only-values -n user.rgd.allow_kill -- "$dir" 2>/dev/null || true)
+        printf '%s|%s|%s|%s|%s\n' "$level" "$applied" "$pref" "$allow" "$dir"
+    done
+}
+
+cmd_status() {
+    need column
+    {
+        printf 'LEVEL\tAPPLIED\tPREF\tKILL\tUNIT\tPATH\n'
+        list_tracked | while IFS='|' read -r level applied pref allow path; do
+            local unit=${path##*/}
+            local applied_fmt='-'
+            if [ -n "$applied" ]; then
+                applied_fmt=$(date -d "@$applied" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$applied")
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$level" "$applied_fmt" "${pref:-.}" "${allow:-.}" "$unit" "$path"
+        done
+    } | column -t -s $'\t'
+}
+
+# Unset every cgroup property rgd could have applied on `unit`, via the
+# user systemd. Uses `--runtime` to match how rgd wrote them. Silent on
+# "Unit not found" — we only emit state for the unit types (.scope/.service)
+# we'd have touched.
+unset_properties() {
+    local unit="$1"
+    systemctl --user set-property --runtime -- "$unit" \
+        CPUWeight= CPUQuotaPerSecUSec= 2>/dev/null || return 0
+}
+
+cmd_panic() {
+    need setfattr
+    # systemctl may not be present in a stripped container; panic should
+    # still strip xattrs even then, so don't `need` it here.
+    local restored=0 failed=0 seen=0
+    while IFS='|' read -r level applied pref allow path; do
+        seen=$((seen + 1))
+        local unit=${path##*/}
+        local ok=1
+
+        # Unset systemd properties. Errors here don't abort — xattr
+        # cleanup still matters.
+        if command -v systemctl >/dev/null 2>&1; then
+            unset_properties "$unit" || ok=0
+        fi
+
+        # Unfreeze if frozen.
+        if [ -w "$path/cgroup.freeze" ]; then
+            printf '0\n' >"$path/cgroup.freeze" 2>/dev/null || true
+        fi
+
+        # Strip every rgd xattr.
+        for key in "${RGD_KEYS[@]}"; do
+            setfattr -x "$key" -- "$path" 2>/dev/null || true
+        done
+
+        if [ "$ok" = 1 ]; then
+            restored=$((restored + 1))
+            printf 'restored: %s (was %s)\n' "$unit" "$level"
+        else
+            failed=$((failed + 1))
+            printf 'partial:  %s (was %s) — systemd unset failed\n' "$unit" "$level" >&2
+        fi
+    done < <(list_tracked)
+
+    printf '\n'
+    printf 'panic complete: %d tracked, %d restored, %d partial\n' "$seen" "$restored" "$failed"
+    if [ "$failed" -gt 0 ]; then
+        exit 1
+    fi
+}
+
+main() {
+    local cmd=${1:-}
+    case "$cmd" in
+        status) cmd_status ;;
+        panic) cmd_panic ;;
+        -h|--help|help|'') usage ;;
+        *)
+            printf 'rgctl: unknown command %q\n\n' "$cmd" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

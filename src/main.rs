@@ -1,15 +1,18 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::StreamExt;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::fdo::DBusProxy;
 use zbus::Connection;
 
 use rgd::cgroup::{self, Snapshot};
-use rgd::policy::{self, LadderConfig, StateMachine, Transition};
+use rgd::enforce::{EnforceError, Enforcer, EnforcementGates, SystemdBackend};
+use rgd::policy::{self, LadderConfig, Level, StateMachine, Transition};
 use rgd::protect::{self, Protect, ProtectSet};
 use rgd::psi::{self, Resource, Trigger};
 
@@ -17,7 +20,7 @@ use rgd::psi::{self, Resource, Trigger};
 #[command(
     name = "rgd",
     version,
-    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon (Milestone 1–3 observer)"
+    about = "Responsiveness Guardian — PSI-driven Linux responsiveness daemon"
 )]
 struct Cli {
     /// Which kernel PSI resource to monitor.
@@ -36,6 +39,21 @@ struct Cli {
     /// How many top offender cgroups to log per trigger fire.
     #[arg(long, default_value_t = 5)]
     top_n: usize,
+
+    /// Apply graduated throttling. Without this flag every transition is
+    /// logged as `[DRY-RUN] would: …` but no system state changes.
+    #[arg(long)]
+    enforce: bool,
+
+    /// Opt in to `cgroup.freeze` as an escalation step. Reversible, but
+    /// visibly pauses the cgroup's tasks — off by default.
+    #[arg(long)]
+    enable_freeze: bool,
+
+    /// Opt in to `cgroup.kill`. Additionally requires per-cgroup
+    /// `user.rgd.allow_kill` xattr. Off by default.
+    #[arg(long)]
+    enable_kill: bool,
 
     /// Log output format. `text` is human-readable; `json` is one-line JSON
     /// per event, suitable for piping into `jq` or a log shipper.
@@ -58,13 +76,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.log_format);
 
+    let mode = if cli.enforce { "enforce" } else { "dry-run" };
     info!(
         resource = cli.resource.as_str(),
         threshold_ms = cli.threshold_ms,
         window_ms = cli.window_ms,
         top_n = cli.top_n,
+        mode,
+        enable_freeze = cli.enable_freeze,
+        enable_kill = cli.enable_kill,
         log_format = ?cli.log_format,
-        "starting PSI + per-cgroup observer (dry-run policy engine)"
+        "starting responsiveness guardian"
     );
 
     let threshold_us = cli.threshold_ms.saturating_mul(1_000);
@@ -83,8 +105,9 @@ async fn main() -> Result<()> {
         "baseline pressure snapshot established"
     );
 
-    // Connect to the session bus once; the handle drives both the initial
-    // D-Bus discovery and the NameOwnerChanged listener.
+    // Connect to the session bus once; the handle drives D-Bus discovery,
+    // the NameOwnerChanged listener, and — in --enforce mode — all
+    // SetUnitProperties calls to the user systemd instance.
     let bus = match Connection::session().await {
         Ok(c) => Some(c),
         Err(e) => {
@@ -110,10 +133,56 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut state_machine = StateMachine::new(LadderConfig::default());
+    let enforcer: Option<Enforcer> = if cli.enforce {
+        match bus.as_ref() {
+            Some(conn) => {
+                let backend = SystemdBackend::from_session(conn.clone());
+                let gates = EnforcementGates {
+                    enable_freeze: cli.enable_freeze,
+                    enable_kill: cli.enable_kill,
+                };
+                info!(
+                    enable_freeze = gates.enable_freeze,
+                    enable_kill = gates.enable_kill,
+                    "enforcement enabled via user systemd"
+                );
+                Some(Enforcer::new(backend, gates))
+            }
+            None => {
+                warn!(
+                    "--enforce requested but session D-Bus unreachable; \
+                     falling back to dry-run"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut state_machine = StateMachine::new(LadderConfig {
+        enable_freeze: cli.enable_freeze,
+        enable_kill: cli.enable_kill,
+        ..LadderConfig::default()
+    });
+
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
 
     loop {
-        trigger.wait().await.context("waiting on PSI trigger")?;
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("SIGTERM received; tearing down");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("SIGINT received; tearing down");
+                break;
+            }
+            res = trigger.wait() => {
+                res.context("waiting on PSI trigger")?;
+            }
+        }
 
         let current = match cgroup::snapshot(cli.resource) {
             Ok(s) => s,
@@ -209,17 +278,98 @@ async fn main() -> Result<()> {
             );
         }
 
-        let observations: Vec<(std::path::PathBuf, u64)> = ranking
+        let observations: Vec<(PathBuf, u64)> = ranking
             .offenders
             .iter()
             .map(|a| (a.path.clone(), a.exclusive_delta_usec))
             .collect();
         let transitions = state_machine.observe(Instant::now(), &observations);
         for t in transitions {
-            log_transition(&t);
+            log_transition(&t, enforcer.is_some());
+            if let Some(enforcer) = enforcer.as_ref() {
+                apply_transition(enforcer, &t).await;
+            }
         }
 
         previous = current;
+    }
+
+    // Teardown: revert every cgroup we're still holding state on.
+    if let Some(enforcer) = enforcer.as_ref() {
+        let tracked: Vec<(PathBuf, Level)> = state_machine
+            .states
+            .iter()
+            .map(|(p, s)| (p.clone(), s.level))
+            .collect();
+        let total = tracked.len();
+        let mut reverted = 0;
+        for (path, level) in tracked {
+            if !level.is_enforcement() {
+                continue;
+            }
+            let unit = cgroup::unit_from_path(&path);
+            match enforcer.revert_to_observe(&path, &unit).await {
+                Ok(()) => {
+                    reverted += 1;
+                    info!(
+                        path = %path.display(),
+                        unit = %unit.unit,
+                        from = level.as_str(),
+                        "teardown: reverted to Observe",
+                    );
+                }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    unit = %unit.unit,
+                    error = %e,
+                    "teardown: revert failed — run `rgctl panic` if needed",
+                ),
+            }
+        }
+        info!(
+            total_tracked = total,
+            reverted,
+            "teardown complete"
+        );
+    }
+
+    Ok(())
+}
+
+async fn apply_transition(enforcer: &Enforcer, t: &Transition) {
+    let (path, target) = match t {
+        Transition::Enter { .. } => return, // Observe — no property to write.
+        Transition::Escalate { path, to, .. } => (path, *to),
+        Transition::Deescalate { path, to, .. } => (path, *to),
+        Transition::Untrack { .. } => return, // already reverted at the Observe step.
+    };
+    match enforcer.apply(path, target).await {
+        Ok(()) => {
+            info!(
+                path = %path.display(),
+                level = target.as_str(),
+                "applied level",
+            );
+        }
+        Err(EnforceError::Gated { level, reason }) => {
+            info!(
+                path = %path.display(),
+                level = level.as_str(),
+                reason,
+                "gated: level not applied",
+            );
+        }
+        Err(EnforceError::Protected(p)) => {
+            warn!(path = %p, "refused: protected cgroup reached enforcement");
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                level = target.as_str(),
+                error = %e,
+                "enforcement failed",
+            );
+        }
     }
 }
 
@@ -252,10 +402,11 @@ async fn run_name_owner_listener(conn: Connection, protect: Protect) -> Result<(
     Ok(())
 }
 
-fn log_transition(t: &Transition) {
+fn log_transition(t: &Transition, enforcing: bool) {
+    let prefix = if enforcing { "[APPLY]" } else { "[DRY-RUN]" };
     match t {
         Transition::Enter { path } => {
-            info!(path = %path.display(), "[DRY-RUN] enter: tracking at Observe");
+            info!(path = %path.display(), "{} enter: tracking at Observe", prefix);
         }
         Transition::Escalate {
             path,
@@ -270,7 +421,8 @@ fn log_transition(t: &Transition) {
                 to = to.as_str(),
                 delta_usec = *delta_usec,
                 dwell_ms = dwell.as_millis() as u64,
-                "[DRY-RUN] would: {}: {} → {} (Δ={}, dwell={:.1}s)",
+                "{} {}: {} → {} (Δ={}, dwell={:.1}s)",
+                prefix,
                 path.display(),
                 from.as_str(),
                 to.as_str(),
@@ -289,7 +441,8 @@ fn log_transition(t: &Transition) {
                 from = from.as_str(),
                 to = to.as_str(),
                 clear_for_ms = clear_for.as_millis() as u64,
-                "[DRY-RUN] would: {}: {} → {} (clear={:.1}s)",
+                "{} {}: {} → {} (clear={:.1}s)",
+                prefix,
                 path.display(),
                 from.as_str(),
                 to.as_str(),
@@ -303,7 +456,8 @@ fn log_transition(t: &Transition) {
             info!(
                 path = %path.display(),
                 dwell_at_observe_ms = dwell_at_observe.as_millis() as u64,
-                "[DRY-RUN] untrack: {} (Observe for {:.1}s)",
+                "{} untrack: {} (Observe for {:.1}s)",
+                prefix,
                 path.display(),
                 dwell_at_observe.as_secs_f64(),
             );

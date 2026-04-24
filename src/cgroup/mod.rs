@@ -2,6 +2,7 @@ pub mod pressure;
 pub mod procs;
 pub mod tree;
 pub mod unit;
+pub mod xattr;
 
 pub use pressure::{read_one, snapshot, snapshot_from_nodes, CgroupPressure, Snapshot};
 pub use tree::{pressure_file, walk, walk_from, CgroupNode, CGROUP_ROOT};

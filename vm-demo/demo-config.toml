@@ -1,0 +1,22 @@
+# Compressed ladder timings so a take fits in ~90s instead of ~4 minutes.
+# Threshold lowered so triggers fire reliably under demo workloads.
+[triggers]
+resource = "cpu"
+threshold_ms = 50
+window_ms = 1000
+top_n = 5
+
+[policy]
+escalate_observe_to_weight = "5s"
+escalate_weight_to_idle    = "10s"
+escalate_idle_to_quota50   = "15s"
+escalate_quota50_to_quota25 = "20s"
+deescalate_after = "10s"
+untrack_after    = "30s"
+
+[enforcement]
+enable_freeze = false
+enable_kill = false
+
+[protect]
+extra_names = []

@@ -74,6 +74,12 @@ pub struct LadderConfig {
   /// Time a cgroup must sit at `Observe` with no pressure before being
   /// dropped from the tracked set entirely.
   pub untrack_after: Duration,
+  /// Minimum share (as a percentage of system-wide PSI delta in the same
+  /// window) of stall an offender must be responsible for before we'll
+  /// track it. Filters out genuine-but-incidental pressure from user-active
+  /// apps under contention — e.g., during a 96-thread runaway, your editor
+  /// is also "stalled" a little, but its 3% share is collateral, not cause.
+  pub min_share_pct: u8,
   pub enable_freeze: bool,
   pub enable_kill: bool,
 }
@@ -103,6 +109,7 @@ impl Default for LadderConfig {
       ],
       deescalate_after: Duration::from_secs(30),
       untrack_after: Duration::from_secs(120),
+      min_share_pct: 30,
       enable_freeze: false,
       enable_kill: false,
     }

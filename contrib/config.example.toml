@@ -65,6 +65,13 @@ deescalate_after = "30s"
 # values let state-machine memory rotate faster.
 untrack_after = "120s"
 
+# Minimum share (percent of system-wide PSI delta in the same window) of
+# stall an offender must own before we'll start tracking it. Filters out
+# user-active apps that look "stalled" only because something else is
+# saturating the CPU — your editor at ~3% during a runaway is collateral,
+# not cause. Set to 0 to track every positive-delta offender.
+min_share_pct = 30
+
 # -----------------------------------------------------------------------------
 # Enforcement: the escape hatches
 # -----------------------------------------------------------------------------

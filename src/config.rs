@@ -147,6 +147,7 @@ struct RawPolicy {
   escalate_quota50_to_quota25: Option<String>,
   deescalate_after: Option<String>,
   untrack_after: Option<String>,
+  min_share_pct: Option<u8>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -260,6 +261,14 @@ impl RawConfig {
       bail!("policy.{{deescalate_after,untrack_after}} must be > 0");
     }
 
+    let min_share_pct = self
+      .policy
+      .min_share_pct
+      .unwrap_or(default_ladder.min_share_pct);
+    if min_share_pct > 100 {
+      bail!("policy.min_share_pct = {min_share_pct}; must be in 0..=100");
+    }
+
     let enable_freeze = self.enforcement.enable_freeze.unwrap_or(false);
     let enable_kill = self.enforcement.enable_kill.unwrap_or(false);
     if enable_kill && !enable_freeze {
@@ -280,6 +289,7 @@ impl RawConfig {
         escalate_after,
         deescalate_after,
         untrack_after,
+        min_share_pct,
         enable_freeze,
         enable_kill,
       },
@@ -475,6 +485,30 @@ enable_freeze = false
       .validate()
       .unwrap_err();
     assert!(err.to_string().contains("enable_kill"));
+  }
+
+  #[test]
+  fn parses_min_share_pct() {
+    let text = r#"[policy]
+min_share_pct = 75
+"#;
+    let cfg = toml::from_str::<RawConfig>(text)
+      .unwrap()
+      .validate()
+      .unwrap();
+    assert_eq!(cfg.ladder.min_share_pct, 75);
+  }
+
+  #[test]
+  fn rejects_min_share_pct_above_100() {
+    let text = r#"[policy]
+min_share_pct = 150
+"#;
+    let err = toml::from_str::<RawConfig>(text)
+      .unwrap()
+      .validate()
+      .unwrap_err();
+    assert!(err.to_string().contains("min_share_pct"));
   }
 
   #[test]

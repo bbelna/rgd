@@ -141,7 +141,10 @@ mod tests {
   fn empty_tree_is_an_error() {
     // A non-existent root should yield an error rather than silently
     // returning an empty list.
-    let err = walk_from(Path::new("/definitely/not/a/real/path"), Resource::Cpu);
+    let err = walk_from(
+      Path::new("/definitely/not/a/real/path"),
+      Resource::Cpu
+    );
 
     assert!(err.is_err());
   }

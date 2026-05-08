@@ -255,8 +255,18 @@ async fn main() -> Result<()> {
     }
 
     let set_snapshot = protect.snapshot().await;
-    let ranking =
-      policy::rank_with_protection(&previous, &current, cfg.triggers.top_n, &set_snapshot);
+    // Filter: cgroups with no procs of their own (typically slices and
+    // rollups) are unthrottlable — applying CPUWeight to a slice
+    // inherits-down to every child. They surface in the rank only when a
+    // child cgroup vanishes between snapshots and its accumulated stall
+    // rolls up into the parent's exclusive delta.
+    let ranking = policy::rank_with_protection(
+      &previous,
+      &current,
+      cfg.triggers.top_n,
+      &set_snapshot,
+      |path| cgroup::procs::read_count(path).map(|n| n > 0).unwrap_or(false),
+    );
 
     if ranking.offenders.is_empty() && ranking.protected_skipped.is_empty() {
       info!(
@@ -288,10 +298,18 @@ async fn main() -> Result<()> {
       );
     }
 
+    let min_share_pct = u64::from(cfg.ladder.min_share_pct);
+    let mut observations: Vec<(PathBuf, u64)> = Vec::with_capacity(ranking.offenders.len());
     for (i, attr) in ranking.offenders.iter().enumerate() {
       let unit = cgroup::unit_from_path(&attr.path);
       let procs = cgroup::procs::read_count(&attr.path).unwrap_or(0);
       let delta_str = fmt_duration_us(attr.exclusive_delta_usec);
+      let share_pct = attr
+        .exclusive_delta_usec
+        .saturating_mul(100)
+        .checked_div(sys_delta_usec)
+        .unwrap_or(0);
+      let above_share = sys_delta_usec > 0 && share_pct >= min_share_pct;
       info!(
           rank = i + 1,
           path = %attr.path.display(),
@@ -303,7 +321,9 @@ async fn main() -> Result<()> {
           full_delta_usec = attr.full_delta_usec,
           some_total_usec = attr.some_total_usec,
           system_delta_usec = sys_delta_usec,
-          "[{}/some +{}/{}] {} ({}, {} procs) — delta {} of {} total",
+          share_pct,
+          tracked = above_share,
+          "[{}/some +{}/{}] {} ({}, {} procs) — delta {} of {} total ({}%{})",
           resource_str,
           sys_delta_str,
           window_str,
@@ -312,14 +332,14 @@ async fn main() -> Result<()> {
           procs,
           delta_str,
           sys_delta_str,
+          share_pct,
+          if above_share { "" } else { ", below share gate" },
       );
+      if above_share {
+        observations.push((attr.path.clone(), attr.exclusive_delta_usec));
+      }
     }
 
-    let observations: Vec<(PathBuf, u64)> = ranking
-      .offenders
-      .iter()
-      .map(|a| (a.path.clone(), a.exclusive_delta_usec))
-      .collect();
     let transitions = state_machine.observe(Instant::now(), &observations);
     for t in transitions {
       log_transition(&t, enforcer.is_some());

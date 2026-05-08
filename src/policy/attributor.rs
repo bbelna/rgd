@@ -52,11 +52,18 @@ pub fn rank(previous: &Snapshot, current: &Snapshot, top_n: usize) -> Vec<Attrib
 /// Like [`rank`], but partitions the result into actionable offenders and a
 /// separate list of protected cgroups that would otherwise have been ranked.
 /// Preserves all ordering; each list is independently capped at `top_n`.
+///
+/// `is_throttle_candidate` is queried for non-protected cgroups: a `false`
+/// return drops the cgroup silently from both lists. It exists so callers
+/// can suppress structurally-unthrottlable cgroups (slices and rollups with
+/// no procs of their own — throttling those would inherit-down to every
+/// child including protected ones).
 pub fn rank_with_protection(
   previous: &Snapshot,
   current: &Snapshot,
   top_n: usize,
   protect: &ProtectSet,
+  is_throttle_candidate: impl Fn(&Path) -> bool,
 ) -> Ranking {
   let all = full_rank(previous, current);
   let mut offenders = Vec::with_capacity(top_n);
@@ -66,7 +73,7 @@ pub fn rank_with_protection(
       if protected_skipped.len() < top_n {
         protected_skipped.push(attr);
       }
-    } else if offenders.len() < top_n {
+    } else if is_throttle_candidate(&attr.path) && offenders.len() < top_n {
       offenders.push(attr);
     }
     if offenders.len() >= top_n && protected_skipped.len() >= top_n {
@@ -332,7 +339,7 @@ mod tests {
     let prev = snap(&[("/a", 0, 0), ("/b", 0, 0), ("/c", 0, 0)]);
     let cur = snap(&[("/a", 1000, 0), ("/b", 500, 0), ("/c", 250, 0)]);
     let protect = protect_with(&["/a"]);
-    let ranking = rank_with_protection(&prev, &cur, 5, &protect);
+    let ranking = rank_with_protection(&prev, &cur, 5, &protect, |_| true);
 
     assert_eq!(ranking.protected_skipped.len(), 1);
     assert_eq!(ranking.protected_skipped[0].path, PathBuf::from("/a"));
@@ -352,7 +359,7 @@ mod tests {
       ("/d", 100, 0),
     ]);
     let protect = protect_with(&["/a", "/c"]);
-    let ranking = rank_with_protection(&prev, &cur, 1, &protect);
+    let ranking = rank_with_protection(&prev, &cur, 1, &protect, |_| true);
     assert_eq!(ranking.offenders.len(), 1);
     assert_eq!(ranking.offenders[0].path, PathBuf::from("/b"));
     assert_eq!(ranking.protected_skipped.len(), 1);
@@ -370,7 +377,7 @@ mod tests {
       ("/other", 100, 0),
     ]);
     let protect = protect_with(&["/parent"]);
-    let ranking = rank_with_protection(&prev, &cur, 5, &protect);
+    let ranking = rank_with_protection(&prev, &cur, 5, &protect, |_| true);
     assert_eq!(ranking.offenders.len(), 1);
     assert_eq!(ranking.offenders[0].path, PathBuf::from("/other"));
     // `/parent` has zero exclusive (child consumes it all) so doesn't
@@ -380,5 +387,38 @@ mod tests {
       ranking.protected_skipped[0].path,
       PathBuf::from("/parent/child")
     );
+  }
+
+  #[test]
+  fn rank_with_protection_drops_non_throttle_candidates() {
+    // Simulates the pathology in the wild: a parent slice (`/app.slice`)
+    // accrues an exclusive delta when a child cgroup vanishes between
+    // snapshots. With no procs of its own there's nothing to throttle —
+    // and applying CPUWeight to the slice would penalize every child.
+    let prev = snap(&[
+      ("/app.slice", 0, 0),
+      ("/app.slice/leaf.scope", 0, 0),
+      ("/other.scope", 0, 0),
+    ]);
+    let cur = snap(&[
+      ("/app.slice", 800, 0),
+      ("/app.slice/leaf.scope", 200, 0),
+      ("/other.scope", 100, 0),
+    ]);
+    let protect = ProtectSet::empty();
+    let ranking = rank_with_protection(&prev, &cur, 5, &protect, |path| {
+      // Pretend `/app.slice` has zero procs — a rollup-only cgroup.
+      path != Path::new("/app.slice")
+    });
+    let offender_paths: Vec<_> = ranking.offenders.iter().map(|a| a.path.clone()).collect();
+    assert_eq!(
+      offender_paths,
+      vec![
+        PathBuf::from("/app.slice/leaf.scope"),
+        PathBuf::from("/other.scope")
+      ],
+      "the slice should have been filtered out, leaving the leaf scopes",
+    );
+    assert!(ranking.protected_skipped.is_empty());
   }
 }
